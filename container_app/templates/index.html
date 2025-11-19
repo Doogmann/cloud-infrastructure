@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="sv">
+<head>
+  <meta charset="UTF-8" />
+  <title>Snake – Flask + Docker Swarm</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+  <div class="wrapper">
+    <h1>Snake 🐍</h1>
+    <p class="subtitle">
+      Körs i container: <strong>{{ hostname }}</strong>
+    </p>
+
+    <div class="info">
+      <span>Poäng: <strong id="score">0</strong></span>
+      <span>Rekord: <strong id="highScore">0</strong></span>
+      <span>Hastighet: <strong id="speedLabel">Normal</strong></span>
+    </div>
+
+    <canvas id="game" width="400" height="400"></canvas>
+
+    <div class="controls">
+      <p>Använd piltangenterna (eller WASD) för att styra ormen.</p>
+      <button id="restartBtn">Starta om</button>
+      <select id="speedSelect">
+        <option value="120">Långsam</option>
+        <option value="80" selected>Normal</option>
+        <option value="50">Snabb</option>
+      </select>
+    </div>
+
+    <p class="small">
+      Poängen och high score sparas bara i din webbläsare (LocalStorage).<br/>
+      Ladda om sidan – container-namnet ovan ändras varje gång du träffar en ny instans i Docker Swarm.
+    </p>
+  </div>
+
+  <script src="{{ url_for('static', filename='js/snake.js') }}"></script>
+</body>
+</html>
