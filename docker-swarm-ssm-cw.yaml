@@ -1,0 +1,278 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Lab demo + Docker Swarm on existing VPC/Subnet:
+  - EC2 + SSM (no PEM needed) + CloudWatch Agent
+  - 1 Swarm manager + N workers (same subnet)
+  - SSM Parameter Store for join token + manager addr
+  - Deploys nginx (80) + Swarm Visualizer (8080) via Docker stack
+
+Parameters:
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: MyDemoKey
+    Description: Existing EC2 KeyPair for SSH (optional when using SSM Session Manager)
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC to use (default VPC works fine)
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Public subnet in that VPC (workers will also launch here)
+
+  LatestAmiId:
+    Type: "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>"
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64
+    Description: Automatically resolves to the latest Amazon Linux 2023 AMI
+
+  ManagerInstanceType:
+    Type: String
+    Default: t3.small
+    AllowedValues: [t3.nano, t3.micro, t3.small, t3.medium, t3.large, t3.xlarge]
+
+  WorkerInstanceType:
+    Type: String
+    Default: t3.small
+    AllowedValues: [t3.nano, t3.micro, t3.small, t3.medium, t3.large, t3.xlarge]
+
+  WorkerCount:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+    Description: Number of Swarm workers to launch
+
+  SwarmParamPrefix:
+    Type: String
+    Default: /swarm
+    Description: SSM prefix for join token & manager addr (e.g., /swarm)
+
+Resources:
+  # --- Security Group (no self-referencing rules inline) ---
+  SwarmSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Allow SSH(22), HTTP(80), Visualizer(8080), and Swarm internode traffic"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 22,   ToPort: 22,   CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 80,   ToPort: 80,   CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 8080, ToPort: 8080, CidrIp: 0.0.0.0/0 }
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-sg' }]
+
+  # Self-referencing Swarm ports as separate resources (breaks the cycle)
+  SGIngressSwarm2377:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref SwarmSecurityGroup
+      IpProtocol: tcp
+      FromPort: 2377
+      ToPort: 2377
+      SourceSecurityGroupId: !Ref SwarmSecurityGroup
+
+  SGIngressSwarm7946TCP:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref SwarmSecurityGroup
+      IpProtocol: tcp
+      FromPort: 7946
+      ToPort: 7946
+      SourceSecurityGroupId: !Ref SwarmSecurityGroup
+
+  SGIngressSwarm7946UDP:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref SwarmSecurityGroup
+      IpProtocol: udp
+      FromPort: 7946
+      ToPort: 7946
+      SourceSecurityGroupId: !Ref SwarmSecurityGroup
+
+  SGIngressSwarm4789UDP:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref SwarmSecurityGroup
+      IpProtocol: udp
+      FromPort: 4789
+      ToPort: 4789
+      SourceSecurityGroupId: !Ref SwarmSecurityGroup
+
+  # --- IAM: SSM + CloudWatch Agent + Parameter Store access ---
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: SwarmParamAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:PutParameter
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:GetParameterHistory
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SwarmParamPrefix}*'
+        - PolicyName: PutCWAgentConfigToSSM
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: AllowWriteCloudWatchAgentConfigToSSM
+                Effect: Allow
+                Action: ssm:PutParameter
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/AmazonCloudWatch-*'
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles: [ !Ref InstanceRole ]
+
+  # --- Manager EC2 (single instance) ---
+  ManagerInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref ManagerInstanceType
+      ImageId: !Ref LatestAmiId
+      KeyName: !Ref KeyName
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds: [ !Ref SwarmSecurityGroup ]
+      IamInstanceProfile: !Ref InstanceProfile
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-manager' }
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+
+          dnf -y update
+          dnf -y install docker awscli amazon-cloudwatch-agent
+          systemctl enable --now docker
+          usermod -aG docker ec2-user
+
+          # Wait for Docker
+          timeout 120 bash -c 'until [ -S /var/run/docker.sock ]; do sleep 2; done' || true
+
+          PRIVATE_IP=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
+
+          # Initialize swarm (idempotent)
+          if ! docker info --format '{{.Swarm.LocalNodeState}}' | grep -q '^active$'; then
+            docker swarm init --advertise-addr "$PRIVATE_IP"
+          fi
+
+          # Publish token and manager address to SSM
+          TOKEN=$(docker swarm join-token -q worker)
+          aws ssm put-parameter --name "${SwarmParamPrefix}/join-token" --value "$TOKEN" --type String --overwrite
+          aws ssm put-parameter --name "${SwarmParamPrefix}/manager-addr" --value "$PRIVATE_IP" --type String --overwrite
+
+          # Deploy sample stack: Flask webapp
+          cat >/root/docker-stack.yml <<'EOF'
+          version: "3.8"
+          services:
+            web:
+              image: dogman11/flask-swarm-test:latest
+              deploy:
+                replicas: 3
+                restart_policy:
+                  condition: on-failure
+                update_config:
+                  parallelism: 1
+                  delay: 5s
+              ports:
+                - "80:5000"        # Container lyssnar på 5000, vi exponera 80
+              networks:
+                - webnet
+
+          networks:
+            webnet:
+              driver: overlay
+          EOF
+
+          docker stack deploy -c /root/docker-stack.yml myapp
+
+          /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a status || true
+
+  # --- Worker Launch Template + ASG ---
+  WorkerLT:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref WorkerInstanceType
+        KeyName: !Ref KeyName
+        IamInstanceProfile: { Name: !Ref InstanceProfile }
+        SecurityGroupIds: [ !Ref SwarmSecurityGroup ]
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -euxo pipefail
+
+            dnf -y update
+            dnf -y install docker awscli amazon-cloudwatch-agent
+            systemctl enable --now docker
+            usermod -aG docker ec2-user
+
+            # Wait for Docker
+            timeout 120 bash -c 'until [ -S /var/run/docker.sock ]; do sleep 2; done' || true
+
+            # Poll for SSM params written by manager
+            get_param() { aws ssm get-parameter --name "$1" --query 'Parameter.Value' --output text 2>/dev/null || true; }
+            for i in $(seq 1 120); do
+              TOKEN=$(get_param "${SwarmParamPrefix}/join-token")
+              MGR=$(get_param "${SwarmParamPrefix}/manager-addr")
+              if [ -n "$TOKEN" ] && [ -n "$MGR" ]; then break; fi
+              sleep 5
+            done
+
+            # Join swarm if not already a member
+            if ! docker info --format '{{.Swarm.LocalNodeState}}' | grep -q '^active$'; then
+              docker swarm join --token "$TOKEN" "$MGR:2377" || true
+            fi
+
+            /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a status || true
+
+  WorkerASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier: [ !Ref SubnetId ]
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WorkerLT
+        Version: !GetAtt WorkerLT.LatestVersionNumber
+      MinSize: !Ref WorkerCount
+      MaxSize: !Ref WorkerCount
+      DesiredCapacity: !Ref WorkerCount
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-worker'
+          PropagateAtLaunch: true
+
+Outputs:
+  InstanceId:
+    Description: Swarm manager instance ID
+    Value: !Ref ManagerInstance
+
+  ManagerPublicIP:
+    Description: Public IP of the Swarm manager
+    Value: !GetAtt ManagerInstance.PublicIp
+
+  WebURL:
+    Description: Nginx welcome page / demo service
+    Value: !Sub "http://${ManagerInstance.PublicIp}"
+
+  VisualizerURL:
+    Description: Swarm Visualizer UI
+    Value: !Sub "http://${ManagerInstance.PublicIp}:8080"
+
+  SsmParamPrefix:
+    Description: SSM Parameter Store prefix used for join token and manager addr
+    Value: !Ref SwarmParamPrefix

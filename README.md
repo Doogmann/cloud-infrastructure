@@ -18,3 +18,4 @@ sudo docker service update \
 
 
 
+docker run --rm -p 5000:5000 dogman11/flask-swarm-test:latest
